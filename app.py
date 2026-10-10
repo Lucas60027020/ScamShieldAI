@@ -3,6 +3,8 @@ import re
 import ssl
 import smtplib
 import sqlite3
+import psycopg
+from psycopg.rows import dict_row
 import secrets
 import time
 import json
@@ -44,6 +46,11 @@ BASE_DIR = Path(__file__).resolve().parent
 DATABASE_PATH = BASE_DIR / "scamshield.db"
 
 load_dotenv(BASE_DIR / ".env")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
+# Support both common PostgreSQL URL prefixes.
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
 # ==========================================
 # OpenAI Configuration
 # ==========================================
@@ -91,57 +98,127 @@ limiter = Limiter(
 
 @contextmanager
 def database():
-    connection = sqlite3.connect(
-        DATABASE_PATH,
-        timeout=10,
-    )
+    """Use PostgreSQL on Vercel and SQLite locally."""
 
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
+    if DATABASE_URL:
+        raw_connection = psycopg.connect(
+            DATABASE_URL,
+            row_factory=dict_row,
+            connect_timeout=10,
+        )
+        is_postgres = True
+
+    else:
+        raw_connection = sqlite3.connect(
+            DATABASE_PATH,
+            timeout=10,
+        )
+        raw_connection.row_factory = sqlite3.Row
+        raw_connection.execute("PRAGMA foreign_keys = ON")
+        is_postgres = False
 
     try:
-        yield connection
-        connection.commit()
+        yield DatabaseConnectionAdapter(
+            raw_connection,
+            is_postgres,
+        )
 
     except Exception:
-        connection.rollback()
+        raw_connection.rollback()
         raise
 
+    else:
+        raw_connection.commit()
+
     finally:
-        connection.close()
+        raw_connection.close()
+
+
+class DatabaseConnectionAdapter:
+    """Support existing SQL queries with both databases."""
+
+    def __init__(self, connection, is_postgres):
+        self.connection = connection
+        self.is_postgres = is_postgres
+
+    def execute(self, query, parameters=()):
+        if self.is_postgres:
+            query = query.replace("?", "%s")
+
+        return self.connection.execute(
+            query,
+            parameters,
+        )
 
 
 def initialize_database():
+    """Create the appropriate database tables."""
+
     with database() as connection:
 
-        connection.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                email TEXT NOT NULL UNIQUE,
-                password_hash TEXT NOT NULL,
-                email_verified INTEGER NOT NULL DEFAULT 0,
-                created_at INTEGER NOT NULL
-            )
-        """)
+        # PostgreSQL database on Vercel
+        if DATABASE_URL:
 
-        connection.execute("""
-            CREATE TABLE IF NOT EXISTS email_otps (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                purpose TEXT NOT NULL,
-                code_hash TEXT NOT NULL,
-                expires_at INTEGER NOT NULL,
-                attempts INTEGER NOT NULL DEFAULT 0,
-                created_at INTEGER NOT NULL,
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id BIGSERIAL PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    email TEXT NOT NULL UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    email_verified INTEGER NOT NULL DEFAULT 0,
+                    created_at BIGINT NOT NULL
+                )
+            """)
 
-                UNIQUE(user_id, purpose),
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS email_otps (
+                    id BIGSERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    purpose TEXT NOT NULL,
+                    code_hash TEXT NOT NULL,
+                    expires_at BIGINT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    created_at BIGINT NOT NULL,
 
-                FOREIGN KEY(user_id)
-                    REFERENCES users(id)
-                    ON DELETE CASCADE
-            )
-        """)
+                    UNIQUE(user_id, purpose),
+
+                    FOREIGN KEY(user_id)
+                        REFERENCES users(id)
+                        ON DELETE CASCADE
+                )
+            """)
+
+        # SQLite database for local development
+        else:
+
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    email TEXT NOT NULL UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    email_verified INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL
+                )
+            """)
+
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS email_otps (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    purpose TEXT NOT NULL,
+                    code_hash TEXT NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+
+                    UNIQUE(user_id, purpose),
+
+                    FOREIGN KEY(user_id)
+                        REFERENCES users(id)
+                        ON DELETE CASCADE
+                )
+            """)
 
 
 initialize_database()
@@ -463,12 +540,13 @@ def register():
 
         else:
 
-            cursor = connection.execute(
+            cursor = connection.execute(    
                 """
                 INSERT INTO users
                     (name, email, password_hash,
                      email_verified, created_at)
                 VALUES (?, ?, ?, 0, ?)
+                RETURNING id
                 """,
                 (
                     name,
@@ -478,7 +556,7 @@ def register():
                 ),
             )
 
-            user_id = cursor.lastrowid
+            user_id = cursor.fetchone()["id"]
 
         code = create_otp(
             connection,
